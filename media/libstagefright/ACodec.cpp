@@ -17,7 +17,7 @@
  * code that are surrounded by "DOLBY..." are copyrighted and
  * licensed separately, as follows:
  *
- *  (C) 2011-2014 Dolby Laboratories, Inc.
+ *  (C) 2011-2015 Dolby Laboratories, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -477,7 +477,9 @@ ACodec::ACodec()
       mTimePerCaptureUs(-1ll),
       mCreateInputBuffersSuspended(false),
       mTunneled(false),
-      mIsVideoRenderingDisabled(false) {
+      mIsVideoRenderingDisabled(false),
+      mEncoderComponent(false),
+      mComponentAllocByName(false) {
     mUninitializedState = new UninitializedState(this);
     mLoadedState = new LoadedState(this);
     mLoadedToIdleState = new LoadedToIdleState(this);
@@ -613,7 +615,13 @@ status_t ACodec::allocateBuffersOnPort(OMX_U32 portIndex) {
                     def.nBufferCountActual, def.nBufferSize,
                     portIndex == kPortIndexInput ? "input" : "output");
 
+#ifdef MTK_HARDWARE
+            OMX_U32 memoryAlign = 32;
+            size_t totalSize = def.nBufferCountActual *
+                ((def.nBufferSize + (memoryAlign - 1))&(~(memoryAlign - 1)));
+#else
             size_t totalSize = def.nBufferCountActual * def.nBufferSize;
+#endif
             mDealer[portIndex] = new MemoryDealer(totalSize, "ACodec");
 
             for (OMX_U32 i = 0; i < def.nBufferCountActual; ++i) {
@@ -703,6 +711,20 @@ status_t ACodec::configureOutputBuffersFromNativeWindow(
     def.format.video.nFrameWidth,
     def.format.video.nFrameHeight,
     eNativeColorFormat);
+#elif defined(MTK_HARDWARE)
+    OMX_U32 frameWidth = def.format.video.nFrameWidth;
+    OMX_U32 frameHeight = def.format.video.nFrameHeight;
+
+    if (!strncmp("OMX.MTK.", mComponentName.c_str(), 8)) {
+        frameWidth = def.format.video.nStride;
+        frameHeight = def.format.video.nSliceHeight;
+    }
+
+    err = native_window_set_buffers_geometry(
+            mNativeWindow.get(),
+            frameWidth,
+            frameHeight,
+            def.format.video.eColorFormat);
 #else
     err = native_window_set_buffers_geometry(
             mNativeWindow.get(),
@@ -1199,12 +1221,6 @@ status_t ACodec::setComponentRole(
             "audio_decoder.evrchw", "audio_encoder.evrc" },
         { MEDIA_MIMETYPE_AUDIO_QCELP,
             "audio_decoder,qcelp13Hw", "audio_encoder.qcelp13" },
-#ifdef DOLBY_UDC
-        { MEDIA_MIMETYPE_AUDIO_AC3,
-            "audio_decoder.ac3", NULL },
-        { MEDIA_MIMETYPE_AUDIO_EAC3,
-            "audio_decoder.ec3", NULL },
-#endif // DOLBY_END
 #endif
         { MEDIA_MIMETYPE_AUDIO_AAC,
             "audio_decoder.aac", "audio_encoder.aac" },
@@ -1216,14 +1232,6 @@ status_t ACodec::setComponentRole(
             "audio_decoder.g711mlaw", "audio_encoder.g711mlaw" },
         { MEDIA_MIMETYPE_AUDIO_G711_ALAW,
             "audio_decoder.g711alaw", "audio_encoder.g711alaw" },
-#ifdef ENABLE_AV_ENHANCEMENTS
-#ifdef DOLBY_UDC
-        { MEDIA_MIMETYPE_AUDIO_EAC3,
-            "audio_decoder.ec3", NULL },
-        { MEDIA_MIMETYPE_AUDIO_EAC3_JOC,
-            "audio_decoder.ec3_joc", NULL },
-#endif // DOLBY_END
-#endif
         { MEDIA_MIMETYPE_VIDEO_AVC,
             "video_decoder.avc", "video_encoder.avc" },
         { MEDIA_MIMETYPE_VIDEO_HEVC,
@@ -1265,6 +1273,12 @@ status_t ACodec::setComponentRole(
 #endif
         { MEDIA_MIMETYPE_AUDIO_EAC3,
             "audio_decoder.eac3", "audio_encoder.eac3" },
+#ifdef ENABLE_AV_ENHANCEMENTS
+#ifdef DOLBY_UDC
+        { MEDIA_MIMETYPE_AUDIO_EAC3_JOC,
+            "audio_decoder.eac3_joc", NULL },
+#endif // DOLBY_END
+#endif
     };
 
     static const size_t kNumMimeToRole =
@@ -3569,6 +3583,7 @@ bool ACodec::describeDefaultColorFormat(DescribeColorFormatParams &params) {
         fmt != OMX_COLOR_FormatYUV420PackedPlanar &&
         fmt != OMX_COLOR_FormatYUV420SemiPlanar &&
         fmt != OMX_COLOR_FormatYUV420PackedSemiPlanar &&
+        fmt != OMX_TI_COLOR_FormatYUV420PackedSemiPlanar &&
         fmt != HAL_PIXEL_FORMAT_YV12) {
         ALOGW("do not know color format 0x%x = %d", fmt, fmt);
         return false;
@@ -3641,6 +3656,7 @@ bool ACodec::describeDefaultColorFormat(DescribeColorFormatParams &params) {
         case OMX_COLOR_FormatYUV420SemiPlanar:
             // FIXME: NV21 for sw-encoder, NV12 for decoder and hw-encoder
         case OMX_COLOR_FormatYUV420PackedSemiPlanar:
+        case OMX_TI_COLOR_FormatYUV420PackedSemiPlanar:
             // NV12
             image.mPlane[image.U].mOffset = params.nStride * params.nSliceHeight;
             image.mPlane[image.U].mColInc = 2;
@@ -5098,6 +5114,8 @@ void ACodec::UninitializedState::stateEntered() {
     mCodec->mOMX.clear();
     mCodec->mQuirks = 0;
     mCodec->mFlags = 0;
+    mCodec->mEncoderComponent = 0;
+    mCodec->mComponentAllocByName = 0;
     mCodec->mUseMetadataOnEncoderOutput = 0;
     mCodec->mComponentName.clear();
 }
@@ -5199,6 +5217,7 @@ bool ACodec::UninitializedState::onAllocateComponent(const sp<AMessage> &msg) {
         ssize_t index = matchingCodecs.add();
         OMXCodec::CodecNameAndQuirks *entry = &matchingCodecs.editItemAt(index);
         entry->mName = String8(componentName.c_str());
+        mCodec->mComponentAllocByName = true;
 
         if (!OMXCodec::findCodecQuirks(
                     componentName.c_str(), &entry->mQuirks)) {
@@ -5212,6 +5231,11 @@ bool ACodec::UninitializedState::onAllocateComponent(const sp<AMessage> &msg) {
         }
 
         ALOGV("onAllocateComponent %s %d", mime.c_str(), encoder);
+
+        if (encoder == true) {
+            mCodec->mEncoderComponent = true;
+        }
+
 #ifdef ENABLE_AV_ENHANCEMENTS
     // Call UseQCHWAACEncoder with no arguments to get the correct state since
     // MediaCodecSource does not pass the output format details when calling
@@ -5431,8 +5455,76 @@ bool ACodec::LoadedState::onConfigureComponent(
         ALOGE("[%s] configureCodec returning error %d",
               mCodec->mComponentName.c_str(), err);
 
-        mCodec->signalError(OMX_ErrorUndefined, makeNoSideEffectStatus(err));
-        return false;
+        if (!mCodec->mEncoderComponent && !mCodec->mComponentAllocByName && !strncmp(mime.c_str(), "video/", strlen("video/"))) {
+            Vector<OMXCodec::CodecNameAndQuirks> matchingCodecs;
+
+            OMXCodec::findMatchingCodecs(
+                mime.c_str(),
+                false, // createEncoder
+                NULL,  // matchComponentName
+                0,     // flags
+                &matchingCodecs);
+
+            status_t err = mCodec->mOMX->freeNode(mCodec->mNode);
+
+            if (err != OK) {
+                ALOGE("Failed to freeNode");
+                mCodec->signalError(OMX_ErrorUndefined, makeNoSideEffectStatus(err));
+                return false;
+            }
+
+            mCodec->mNode = NULL;
+            AString componentName;
+            sp<CodecObserver> observer = new CodecObserver;
+            for (size_t matchIndex = 0; matchIndex < matchingCodecs.size();
+                    ++matchIndex) {
+                componentName = matchingCodecs.itemAt(matchIndex).mName.string();
+                if (!strcmp(mCodec->mComponentName.c_str(), componentName.c_str())) {
+                    continue;
+                }
+
+                status_t err = mCodec->mOMX->allocateNode(componentName.c_str(), observer, &mCodec->mNode);
+
+                if (err == OK) {
+                    break;
+                } else {
+                    ALOGW("Allocating component '%s' failed, try next one.", componentName.c_str());
+                }
+
+                mCodec->mNode = NULL;
+            }
+
+            if (mCodec->mNode == NULL) {
+                if (!mime.empty()) {
+                    ALOGE("Unable to instantiate a decoder for type '%s'", mime.c_str());
+                } else {
+                    ALOGE("Unable to instantiate codec '%s'.", componentName.c_str());
+                }
+
+                mCodec->signalError(OMX_ErrorUndefined, makeNoSideEffectStatus(err));
+                return false;
+            }
+
+            sp<AMessage> notify = new AMessage(kWhatOMXMessage, mCodec->id());
+            observer->setNotificationMessage(notify);
+            mCodec->mComponentName = componentName;
+
+            err = mCodec->configureCodec(mime.c_str(), msg);
+
+            if (err != OK) {
+                ALOGE("[%s] configureCodec returning error %d",
+                         mCodec->mComponentName.c_str(), err);
+                mCodec->signalError(OMX_ErrorUndefined, makeNoSideEffectStatus(err));
+                return false;
+            }
+        } else {
+            if (err != OK) {
+                ALOGE("[%s] configureCodec returning error %d",
+                         mCodec->mComponentName.c_str(), err);
+                 mCodec->signalError(OMX_ErrorUndefined, makeNoSideEffectStatus(err));
+                 return false;
+            }
+        }
     }
 
     sp<RefBase> obj;
@@ -5454,6 +5546,7 @@ bool ACodec::LoadedState::onConfigureComponent(
     {
         sp<AMessage> notify = mCodec->mNotify->dup();
         notify->setInt32("what", CodecBase::kWhatComponentConfigured);
+        notify->setString("componentName", mCodec->mComponentName.c_str());
         notify->setMessage("input-format", mCodec->mInputFormat);
         notify->setMessage("output-format", mCodec->mOutputFormat);
         notify->post();

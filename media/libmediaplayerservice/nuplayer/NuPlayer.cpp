@@ -170,7 +170,7 @@ NuPlayer::NuPlayer()
       mOffloadAudio(false),
       mOffloadDecodedPCM(false),
       mSwitchingFromPcmOffload(false),
-      mIsStreaming(true),
+      mIsStreaming(false),
       mAudioDecoderGeneration(0),
       mVideoDecoderGeneration(0),
       mRendererGeneration(0),
@@ -1031,6 +1031,8 @@ void NuPlayer::onResume() {
         return;
     }
     mPaused = false;
+    PLAYER_STATS(profileStart, STATS_PROFILE_RESUME);
+
     if (mSource != NULL) {
         mSource->resume();
     } else {
@@ -1045,7 +1047,8 @@ void NuPlayer::onResume() {
     }
     // |mAudioDecoder| may have been released due to the pause timeout, so re-create it if
     // needed.
-    if (audioDecoderStillNeeded() && mAudioDecoder == NULL) {
+    if (audioDecoderStillNeeded() && mAudioDecoder == NULL
+            && !ExtendedUtils::ShellProp::isAudioDisabled(false)) {
         instantiateDecoder(true /* audio */, &mAudioDecoder);
     }
     if (mRenderer != NULL) {
@@ -1054,7 +1057,35 @@ void NuPlayer::onResume() {
         ALOGW("resume called when renderer is gone or not set");
     }
     PLAYER_STATS(notifyPlaying, true);
-    PLAYER_STATS(profileStart, STATS_PROFILE_RESUME);
+}
+
+status_t NuPlayer::onInstantiateSecureDecoders() {
+    status_t err;
+    if (!(mSourceFlags & Source::FLAG_SECURE)) {
+        return BAD_TYPE;
+    }
+
+    if (mRenderer != NULL) {
+        ALOGE("renderer should not be set when instantiating secure decoders");
+        return UNKNOWN_ERROR;
+    }
+
+    // TRICKY: We rely on mRenderer being null, so that decoder does not start requesting
+    // data on instantiation.
+    if (mNativeWindow != NULL) {
+        err = instantiateDecoder(false, &mVideoDecoder);
+        if (err != OK) {
+            return err;
+        }
+    }
+
+    if (mAudioSink != NULL) {
+        err = instantiateDecoder(true, &mAudioDecoder);
+        if (err != OK) {
+            return err;
+        }
+    }
+    return OK;
 }
 
 void NuPlayer::onStart() {
@@ -1063,17 +1094,6 @@ void NuPlayer::onStart() {
     mAudioEOS = false;
     mVideoEOS = false;
     mStarted = true;
-
-    /* instantiate decoders now for secure playback */
-    if (mSourceFlags & Source::FLAG_SECURE) {
-        if (mNativeWindow != NULL) {
-            instantiateDecoder(false, &mVideoDecoder);
-        }
-
-        if (mAudioSink != NULL) {
-            instantiateDecoder(true, &mAudioDecoder);
-        }
-    }
 
     mSource->start();
 
@@ -1254,7 +1274,7 @@ void NuPlayer::tryOpenAudioSinkForOffload(const sp<AMessage> &format, bool hasVi
     }
 
     status_t err = mRenderer->openAudioSink(
-            format, true /* offloadOnly */, hasVideo, mIsStreaming, AUDIO_OUTPUT_FLAG_NONE, &mOffloadAudio);
+            format, true /* offloadOnly */, hasVideo, AUDIO_OUTPUT_FLAG_NONE, mIsStreaming, &mOffloadAudio);
     if (err != OK) {
         // Any failure we turn off mOffloadAudio.
         mOffloadAudio = false;
@@ -1314,6 +1334,9 @@ status_t NuPlayer::instantiateDecoder(bool audio, sp<DecoderBase> *decoder) {
         notify->setInt32("generation", mAudioDecoderGeneration);
 
         sp<MetaData> audioMeta = mSource->getFormatMeta(true /* audio */);
+        const bool hasVideo = (mSource->getFormat(false /*audio */) != NULL);
+
+        format->setInt32("has-video", hasVideo);
 
         if (mOffloadAudio && !mOffloadDecodedPCM) {
             if (ExtendedUtils::is24bitPCMOffloadEnabled()) {
@@ -1359,7 +1382,7 @@ status_t NuPlayer::instantiateDecoder(bool audio, sp<DecoderBase> *decoder) {
     }
 
     (*decoder)->init();
-    (*decoder)->configure(format, mIsStreaming);
+    (*decoder)->configure(format);
 
     // allocate buffers to decrypt widevine source buffers
     if (!audio && (mSourceFlags & Source::FLAG_SECURE)) {
@@ -1487,7 +1510,7 @@ void NuPlayer::flushDecoder(bool audio, bool needShutdown) {
     FlushStatus newStatus =
         needShutdown ? FLUSHING_DECODER_SHUTDOWN : FLUSHING_DECODER;
 
-    mFlushComplete[audio][false /* isDecoder */] = false;
+    mFlushComplete[audio][false /* isDecoder */] = (mRenderer == NULL);
     mFlushComplete[audio][true /* isDecoder */] = false;
     if (audio) {
         ALOGE_IF(mFlushingAudio != NONE,
@@ -1782,6 +1805,23 @@ void NuPlayer::onSourceNotify(const sp<AMessage> &msg) {
     CHECK(msg->findInt32("what", &what));
 
     switch (what) {
+        case Source::kWhatInstantiateSecureDecoders:
+        {
+            if (mSource == NULL) {
+                // This is a stale notification from a source that was
+                // asynchronously preparing when the client called reset().
+                // We handled the reset, the source is gone.
+                break;
+            }
+
+            sp<AMessage> reply;
+            CHECK(msg->findMessage("reply", &reply));
+            status_t err = onInstantiateSecureDecoders();
+            reply->setInt32("err", err);
+            reply->post();
+            break;
+        }
+
         case Source::kWhatPrepared:
         {
             if (mSource == NULL) {
@@ -1793,6 +1833,14 @@ void NuPlayer::onSourceNotify(const sp<AMessage> &msg) {
 
             int32_t err;
             CHECK(msg->findInt32("err", &err));
+
+            if (err != OK) {
+                // shut down potential secure codecs in case client never calls reset
+                mDeferredActions.push_back(
+                        new FlushDecoderAction(FLUSH_CMD_SHUTDOWN /* audio */,
+                                               FLUSH_CMD_SHUTDOWN /* video */));
+                processDeferredActions();
+            }
 
             sp<NuPlayerDriver> driver = mDriver.promote();
             if (driver != NULL) {
@@ -1860,7 +1908,9 @@ void NuPlayer::onSourceNotify(const sp<AMessage> &msg) {
             if (mStarted && !mPausedByClient) {
                 ALOGI("buffer low, pausing...");
 
+                PLAYER_STATS(profileStart, STATS_PROFILE_PAUSE);
                 onPause();
+                PLAYER_STATS(profileStop, STATS_PROFILE_PAUSE);
             }
             // fall-thru
         }
@@ -1876,7 +1926,8 @@ void NuPlayer::onSourceNotify(const sp<AMessage> &msg) {
             // ignore if not playing
             if (mStarted && !mPausedByClient) {
                 ALOGI("buffer ready, resuming...");
-
+                PLAYER_STATS(notifyPlaying, true);
+                PLAYER_STATS(profileStart, STATS_PROFILE_RESUME);
                 onResume();
             }
             // fall-thru
@@ -2076,6 +2127,13 @@ void NuPlayer::Source::notifyPrepared(status_t err) {
     sp<AMessage> notify = dupNotify();
     notify->setInt32("what", kWhatPrepared);
     notify->setInt32("err", err);
+    notify->post();
+}
+
+void NuPlayer::Source::notifyInstantiateSecureDecoders(const sp<AMessage> &reply) {
+    sp<AMessage> notify = dupNotify();
+    notify->setInt32("what", kWhatInstantiateSecureDecoders);
+    notify->setMessage("reply", reply);
     notify->post();
 }
 

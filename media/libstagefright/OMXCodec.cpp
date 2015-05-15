@@ -16,7 +16,7 @@
  * code that are surrounded by "DOLBY..." are copyrighted and
  * licensed separately, as follows:
  *
- *  (C) 2011-2014 Dolby Laboratories, Inc.
+ *  (C) 2011-2015 Dolby Laboratories, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -1876,12 +1876,6 @@ void OMXCodec::setComponentRole(
             "audio_decoder.evrchw", "audio_encoder.evrc" },
         { MEDIA_MIMETYPE_AUDIO_QCELP,
             "audio_decoder,qcelp13Hw", "audio_encoder.qcelp13" },
-#ifdef DOLBY_UDC
-        { MEDIA_MIMETYPE_AUDIO_AC3,
-            "audio_decoder.ac3", NULL },
-        { MEDIA_MIMETYPE_AUDIO_EAC3,
-            "audio_decoder.ec3", NULL },
-#endif // DOLBY_END
 #endif
         { MEDIA_MIMETYPE_VIDEO_AVC,
             "video_decoder.avc", "video_encoder.avc" },
@@ -1909,9 +1903,9 @@ void OMXCodec::setComponentRole(
             "audio_decoder.ac3", "audio_encoder.ac3" },
 #ifdef DOLBY_UDC
         { MEDIA_MIMETYPE_AUDIO_EAC3,
-            "audio_decoder.ec3", NULL },
+            "audio_decoder.eac3", NULL },
         { MEDIA_MIMETYPE_AUDIO_EAC3_JOC,
-            "audio_decoder.ec3_joc", NULL },
+            "audio_decoder.eac3_joc", NULL },
 #endif // DOLBY_END
 #ifdef DTS_CODEC_M_
         { MEDIA_MIMETYPE_AUDIO_DTS,
@@ -2079,7 +2073,13 @@ status_t OMXCodec::allocateBuffersOnPort(OMX_U32 portIndex) {
             def.nBufferCountActual, def.nBufferSize,
             portIndex == kPortIndexInput ? "input" : "output");
 
+#ifdef MTK_HARDWARE
+    OMX_U32 memoryAlign = 32;
+    size_t totalSize = def.nBufferCountActual *
+        ((def.nBufferSize + (memoryAlign - 1))&(~(memoryAlign - 1)));
+#else
     size_t totalSize = def.nBufferCountActual * def.nBufferSize;
+#endif
     mDealer[portIndex] = new MemoryDealer(totalSize, "OMXCodec");
 
     for (OMX_U32 i = 0; i < def.nBufferCountActual; ++i) {
@@ -2251,13 +2251,7 @@ status_t OMXCodec::allocateOutputBuffersFromNativeWindow() {
         return err;
     }
 
-#ifndef USE_SAMSUNG_COLORFORMAT
-    err = native_window_set_buffers_geometry(
-            mNativeWindow.get(),
-            def.format.video.nFrameWidth,
-            def.format.video.nFrameHeight,
-            def.format.video.eColorFormat);
-#else
+#ifdef USE_SAMSUNG_COLORFORMAT
     OMX_COLOR_FORMATTYPE eNativeColorFormat = def.format.video.eColorFormat;
     setNativeWindowColorFormat(eNativeColorFormat);
 
@@ -2266,6 +2260,26 @@ status_t OMXCodec::allocateOutputBuffersFromNativeWindow() {
     def.format.video.nFrameWidth,
     def.format.video.nFrameHeight,
     eNativeColorFormat);
+#elif defined(MTK_HARDWARE)
+    OMX_U32 frameWidth = def.format.video.nFrameWidth;
+    OMX_U32 frameHeight = def.format.video.nFrameHeight;
+
+    if (!strncmp("OMX.MTK.", mComponentName, 8)) {
+        frameWidth = def.format.video.nStride;
+        frameHeight = def.format.video.nSliceHeight;
+    }
+
+    err = native_window_set_buffers_geometry(
+            mNativeWindow.get(),
+            frameWidth,
+            frameHeight,
+            def.format.video.eColorFormat);
+#else
+    err = native_window_set_buffers_geometry(
+            mNativeWindow.get(),
+            def.format.video.nFrameWidth,
+            def.format.video.nFrameHeight,
+            def.format.video.eColorFormat);
 #endif
 
     if (err != 0) {
@@ -2315,6 +2329,10 @@ status_t OMXCodec::allocateOutputBuffersFromNativeWindow() {
     }
 
     ALOGV("native_window_set_usage usage=0x%lx", usage);
+
+#ifdef MTK_HARDWARE
+    usage |= (GRALLOC_USAGE_SW_WRITE_OFTEN | GRALLOC_USAGE_SW_READ_OFTEN);
+#endif
 
 #ifdef EXYNOS4_ENHANCEMENTS
     err = native_window_set_usage(
@@ -2801,6 +2819,10 @@ void OMXCodec::on_message(const omx_message &msg) {
                 status_t err = freeBuffer(kPortIndexOutput, i);
                 CHECK_EQ(err, (status_t)OK);
 
+            } else if (mPortStatus[kPortIndexOutput] == ENABLED
+                       && (flags & OMX_BUFFERFLAG_DATACORRUPT)) {
+                CODEC_LOGV("Filled buffer data is corrupted, drop buffer");
+                fillOutputBuffer(info);
 #if 0
             } else if (mPortStatus[kPortIndexOutput] == ENABLED
                        && (flags & OMX_BUFFERFLAG_EOS)) {
@@ -4761,10 +4783,12 @@ status_t OMXCodec::read(
     }
     *buffer = info->mMediaBuffer;
 
+#ifndef MTK_HARDWARE
     if (info->mOutputCropChanged) {
         initNativeWindowCrop();
         info->mOutputCropChanged = false;
     }
+#endif
 #ifdef DOLBY_UDC
     if (mDolbyProcessedAudioStateChanged) {
         mDolbyProcessedAudioStateChanged = false;
@@ -4995,6 +5019,8 @@ void OMXCodec::initOutputFormat(const sp<MetaData> &inputFormat) {
             mOutputFormat->setInt32(kKeyColorFormat, imageDef->eColorFormat);
             mOutputFormat->setInt32(kKeyWidth, imageDef->nFrameWidth);
             mOutputFormat->setInt32(kKeyHeight, imageDef->nFrameHeight);
+            mOutputFormat->setInt32(kKeyStride, imageDef->nStride);
+            mOutputFormat->setInt32(kKeySliceHeight, imageDef->nSliceHeight);
             break;
         }
 
@@ -5200,9 +5226,12 @@ void OMXCodec::initOutputFormat(const sp<MetaData> &inputFormat) {
                 }
 
                 if (mNativeWindow != NULL) {
+#ifndef MTK_HARDWARE
                      if (mInSmoothStreamingMode) {
                          mOutputCropChanged = true;
-                     } else {
+                     } else
+#endif
+                     {
                          initNativeWindowCrop();
                      }
                 }
