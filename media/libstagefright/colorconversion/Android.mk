@@ -8,6 +8,11 @@ LOCAL_SRC_FILES:=                     \
 LOCAL_C_INCLUDES := \
         $(TOP)/frameworks/native/include/media/openmax \
         $(TOP)/hardware/msm7k
+		
+ifeq ($(TARGET_QCOM_LEGACY_OMX),true)
+        LOCAL_CFLAGS += -DQCOM_LEGACY_OMX
+        LOCAL_C_INCLUDES += $(TOP)$(call project-path-for,qcom-display)/libgralloc
+endif
 
 LOCAL_MODULE:= libstagefright_color_conversion
 
